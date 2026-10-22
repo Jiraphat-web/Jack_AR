@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mini AR Face</title>
+  <script type="importmap">
+    { "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "mindar-face-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-face-three.prod.js"
+    } }
+  </script>
+  <style>
+    body { margin: 0; }
+    #container { width: 100vw; height: 100vh; position: relative; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div id="container"></div>
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+    import { MindARThree } from 'mindar-face-three';
+
+    // ===== ปรับขนาด/ตำแหน่งโมเดลที่นี่ (หรือทดสอบสดผ่าน URL เช่น ?s=1.5&y=0.2&z=-0.3) =====
+    const params = new URLSearchParams(location.search);
+    const num = (key, fallback) => params.has(key) ? parseFloat(params.get(key)) : fallback;
+    const MODEL_URL = 'Mini.glb';        // ไฟล์โมเดลของเรา (วางไว้โฟลเดอร์เดียวกับไฟล์นี้)
+    const MODEL_SCALE = num('s', 1.8);   // ขนาด
+    const OFFSET_X = num('x', 0);        // ซ้าย-ขวา
+    const OFFSET_Y = num('y', 0);        // ขึ้น-ลง
+    const OFFSET_Z = num('z', 0);        // หน้า-หลัง (ค่าลบ = ถอยเข้าหาศีรษะ)
+    const ANCHOR_ID = num('a', 1);       // จุดยึดบนใบหน้า (1 = ปลายจมูก, 168 = ระหว่างคิ้ว)
+    // ==================================================================================
+
+    const mindar = new MindARThree({ container: document.querySelector('#container') });
+    const { renderer, scene, camera } = mindar;
+
+    // สร้าง environment texture แบบห้องสตูดิโอ เพื่อเพิ่มแสงและเงาสะท้อนให้โมเดล
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+    const roomEnvironment = new RoomEnvironment();
+    const environmentTarget = pmremGenerator.fromScene(roomEnvironment);
+    scene.environment = environmentTarget.texture;
+    roomEnvironment.dispose();
+    pmremGenerator.dispose();
+    scene.add(new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1));
+
+    const model = await new GLTFLoader().loadAsync(MODEL_URL);
+    model.scene.scale.setScalar(MODEL_SCALE);
+    model.scene.position.set(OFFSET_X, OFFSET_Y, OFFSET_Z);
+    mindar.addAnchor(ANCHOR_ID).group.add(model.scene);
+
+    const meshes = [];
+    model.scene.traverse(object => {
+      if (object.isMesh && object.morphTargetDictionary && object.morphTargetInfluences) meshes.push(object);
+    });
+
+    // Adaptive smoothing: ต่างจากค่าปัจจุบันน้อย → นุ่มมาก, ต่างมาก → ตามเร็ว
+    const blendshapeSmoothing = { slowTime: 0.1, fastTime: 0.02, low: 0.02, high: 0.2 };
+    const eyeBlinkSmoothing = { slowTime: 0.03, fastTime: 0.008, low: 0.02, high: 0.15 };
+
+    function smoothBlendshape(current, target, deltaTime, settings) {
+      const difference = Math.abs(target - current);
+      const responsiveness = THREE.MathUtils.smoothstep(difference, settings.low, settings.high);
+      const smoothTime = THREE.MathUtils.lerp(settings.slowTime, settings.fastTime, responsiveness);
+      const alpha = 1 - Math.exp(-deltaTime / smoothTime);
+      return THREE.MathUtils.lerp(current, target, alpha);
+    }
+    let previousTime;
+
+    await mindar.start();
+    function animate(time) {
+      const deltaTime = previousTime === undefined ? 0 : (time - previousTime) / 1000;
+      previousTime = time;
+      const categories = mindar.getLatestEstimate()?.blendshapes?.categories;
+      // จับคู่ชื่อ blendshape กับ morph target ของโมเดล เช่น jawOpen, eyeBlinkLeft
+      for (const mesh of meshes) {
+        for (const { categoryName, score } of categories ?? []) {
+          const index = mesh.morphTargetDictionary[categoryName];
+          if (index !== undefined) {
+            const current = mesh.morphTargetInfluences[index];
+            const settings = categoryName === 'eyeBlinkLeft' || categoryName === 'eyeBlinkRight'
+              ? eyeBlinkSmoothing
+              : blendshapeSmoothing;
+            mesh.morphTargetInfluences[index] = smoothBlendshape(current, score, deltaTime, settings);
+          }
+        }
+      }
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+  </script>
+</body>
+</html>
