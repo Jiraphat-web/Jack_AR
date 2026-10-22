@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AR Face Mask</title>
+<style>
+  html,body{margin:0;height:100%;background:#111;color:#fff;font-family:system-ui,sans-serif}
+  #wrap{position:relative;max-width:720px;margin:0 auto;aspect-ratio:3/4;background:#000}
+  canvas{position:absolute;inset:0;width:100%;height:100%;transform:scaleX(-1)}
+  #msg{position:absolute;left:0;right:0;top:45%;text-align:center;padding:0 16px}
+  #bar{display:flex;gap:8px;justify-content:center;padding:12px}
+  button{padding:10px 16px;border:0;border-radius:20px;background:#ff7a9c;color:#fff;font-size:15px}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="out" width="720" height="960"></canvas>
+  <div id="msg">กำลังโหลดโมเดลใบหน้า…</div>
+</div>
+<div id="bar">
+  <button id="snap">📷 บันทึกรูป</button>
+  <button id="flip">🔄 สลับกล้อง</button>
+</div>
+<video id="cam" playsinline muted style="display:none"></video>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/face_mesh.js"></script>
+<script>
+// วางไฟล์ลายหน้ากากจาก Canva (PNG 1024x1024) ไว้โฟลเดอร์เดียวกัน ชื่อ face_texture.png
+const TEXTURE_URL = "face_texture.png";
+// ตำแหน่ง UV และสามเหลี่ยมของโมเดลใบหน้ามาตรฐาน MediaPipe
+const OBJ_URL = "https://cdn.jsdelivr.net/gh/google/mediapipe@v0.10.14/mediapipe/modules/face_geometry/data/canonical_face_model.obj";
+
+const out = document.getElementById("out"), ctx = out.getContext("2d");
+const cam = document.getElementById("cam"), msg = document.getElementById("msg");
+let facing = "user", stream = null, tex = null, uv = [], tris = [], lastLm = null;
+
+function fallbackTexture(){
+  const c = document.createElement("canvas"); c.width = c.height = 1024;
+  const g = c.getContext("2d");
+  g.fillStyle = "rgba(255,190,190,.35)"; g.fillRect(0,0,1024,1024);
+  g.fillStyle = "rgba(255,90,130,.55)";
+  [[300,560],[724,560]].forEach(([x,y])=>{g.beginPath();g.arc(x,y,70,0,7);g.fill();});
+  return c;
+}
+function loadTexture(){
+  return new Promise(res=>{
+    const i = new Image();
+    i.onload = ()=>res(i);
+    i.onerror = ()=>res(fallbackTexture());
+    i.src = TEXTURE_URL;
+  });
+}
+async function loadMesh(){
+  const t = await (await fetch(OBJ_URL)).text();
+  const vt = [];
+  for(const line of t.split("\n")){
+    const p = line.trim().split(/\s+/);
+    if(p[0]==="vt") vt.push([+p[1], 1-(+p[2])]);
+    else if(p[0]==="f") tris.push(p.slice(1,4).map(s=>+s.split("/")[0]-1));
+  }
+  uv = vt;
+}
+
+// วาดสามเหลี่ยมหนึ่งชิ้นโดยแปลงพิกัดจากรูปลาย -> ใบหน้า
+function drawTri(s0,s1,s2,d0,d1,d2){
+  const [x0,y0]=s0,[x1,y1]=s1,[x2,y2]=s2,[u0,v0]=d0,[u1,v1]=d1,[u2,v2]=d2;
+  const det = x0*(y1-y2)+x1*(y2-y0)+x2*(y0-y1);
+  if(Math.abs(det)<1e-6) return;
+  const a=(u0*(y1-y2)+u1*(y2-y0)+u2*(y0-y1))/det;
+  const b=(v0*(y1-y2)+v1*(y2-y0)+v2*(y0-y1))/det;
+  const c=(u0*(x2-x1)+u1*(x0-x2)+u2*(x1-x0))/det;
+  const d=(v0*(x2-x1)+v1*(x0-x2)+v2*(x1-x0))/det;
+  const e=(u0*(x1*y2-x2*y1)+u1*(x2*y0-x0*y2)+u2*(x0*y1-x1*y0))/det;
+  const f=(v0*(x1*y2-x2*y1)+v1*(x2*y0-x0*y2)+v2*(x0*y1-x1*y0))/det;
+  ctx.save();
+  ctx.beginPath(); ctx.moveTo(u0,v0); ctx.lineTo(u1,v1); ctx.lineTo(u2,v2); ctx.closePath();
+  ctx.clip();
+  ctx.transform(a,b,c,d,e,f);
+  ctx.drawImage(tex,0,0);
+  ctx.restore();
+}
+
+function render(image){
+  ctx.drawImage(image,0,0,out.width,out.height);
+  if(!lastLm || !tex || !uv.length) return;
+  const W=out.width,H=out.height,S=tex.width||1024,T=tex.height||1024;
+  for(const [i,j,k] of tris){
+    const P=n=>[lastLm[n].x*W, lastLm[n].y*H];
+    const Q=n=>[uv[n][0]*S, uv[n][1]*T];
+    drawTri(Q(i),Q(j),Q(k),P(i),P(j),P(k));
+  }
+}
+
+const fm = new FaceMesh({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${f}`});
+fm.setOptions({maxNumFaces:1, refineLandmarks:false, minDetectionConfidence:.5, minTrackingConfidence:.5});
+fm.onResults(r=>{
+  msg.style.display="none";
+  lastLm = r.multiFaceLandmarks && r.multiFaceLandmarks[0] || null;
+  render(r.image);
+});
+
+async function startCam(){
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:facing,width:720,height:960},audio:false});
+  cam.srcObject = stream; await cam.play();
+  const loop = async()=>{ if(cam.readyState>=2) await fm.send({image:cam}); requestAnimationFrame(loop); };
+  loop();
+}
+
+document.getElementById("flip").onclick = ()=>{
+  facing = facing==="user"?"environment":"user";
+  out.style.transform = facing==="user"?"scaleX(-1)":"none";
+  startCam();
+};
+document.getElementById("snap").onclick = ()=>{
+  const a=document.createElement("a");
+  a.download="ar-mask.png"; a.href=out.toDataURL("image/png"); a.click();
+};
+
+(async()=>{
+  try{
+    [tex] = await Promise.all([loadTexture(), loadMesh()]);
+    await startCam();
+  }catch(e){
+    msg.textContent = "เปิดกล้องหรือโหลดโมเดลไม่สำเร็จ: " + e.message + " (ต้องเปิดผ่าน https)";
+  }
+})();
+</script>
+</body>
+</html>
